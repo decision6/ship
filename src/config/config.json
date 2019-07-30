@@ -1,0 +1,68 @@
+{
+  "ship": {
+    "user_workspace": "",
+    "templates": {
+      "dir": "",
+      "git_update": "",
+      "git_reset": ""
+    },
+    "repository": {
+      "default_url": "",
+      "default_branch": "master"
+    },
+    "notify": {
+      "slack": {
+        "channel": "",
+        "hook": ""
+      }
+    }
+  },
+  "container_management": {
+    "type": "marathon",
+    "api_url": "",
+    "api_auth": {
+      "type": "basic",
+      "username": "",
+      "password": "",
+      "token": ""
+    },
+    "options": {
+      "vip": true,
+      "fetch": "",
+      "placement": []
+    }
+  },
+  "registry": {
+    "url": "",
+    "username": "",
+    "password": ""
+  },
+  "cluster": {
+    "persistent_data_dir": "/data",
+    "shared_data_dir": "/data/shared",
+    "container_persistent_dir": "/data",
+    "container_shared_dir": "/shared"
+  },
+  "resource_profiles": {
+    "default": "medium",
+    "profiles": {
+      "low": {
+        "cpu": 0.1,
+        "memory": 128
+      },
+      "medium": {
+        "cpu": 0.1,
+        "memory": 256
+      },
+      "high": {
+        "cpu": 0.2,
+        "memory": 512
+      }
+    }
+  },
+  "replacements": {},
+  "dev": {
+    "dependencies": [],
+    "templates": {}
+  }
+}

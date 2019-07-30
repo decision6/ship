@@ -1,0 +1,63 @@
+{
+    "id": "/__APP__",
+    "instances": __INSTANCES__,
+    "container": {
+        "type": "DOCKER",
+        "docker": {
+            "image": "__REGISTRY__/__APP__:__VERSION__",
+            "privileged": false,
+            "forcePullImage": true,
+            "network": "BRIDGE",
+            "portMappings": [{
+                "containerPort": 80,
+                "hostPort": 0,
+                "servicePort": 0,
+                "protocol": "tcp",
+                "name": "__APP__",
+                "labels": {
+                    "VIP_0": "/__APP__:80"
+                }
+            }],
+            "parameters": [{
+                "key": "dns-search",
+                "value": "marathon.l4lb.thisdcos.directory"
+            }, {
+                "key": "dns-search",
+                "value": "marathon.mesos"
+            }]
+        },
+        "volumes": [{
+            "containerPath": "__CONTAINER_PERSISTENT_DIR__",
+            "hostPath": "__PERSISTENT_DATA_DIR__/__APP__",
+            "mode": "RW"
+        }, {
+            "containerPath": "__CONTAINER_SHARED_DIR__",
+            "hostPath": "__SHARED_DATA_DIR__",
+            "mode": "RW"
+        }, {
+            "containerPath": "/ftp",
+            "hostPath": "__PERSISTENT_DATA_DIR__/ftp",
+            "mode": "RW"
+        }]
+    },
+    "cpus": __CPU_LIMIT__,
+    "mem": __MEMORY_LIMIT__,
+    "requirePorts": true,
+    "healthChecks": [{
+        "portIndex": 0,
+        "protocol": "HTTP",
+        "path": "__HEALTH__"
+    }],
+    "env": {
+        "DNSMASQ_SEARCH_DOMAINS": "marathon.l4lb.thisdcos.directory,marathon.mesos",
+        "APP_DATA": "__CONTAINER_PERSISTENT_DIR__",
+        "APP_SHARED_DATA": "__CONTAINER_SHARED_DIR__"
+    },
+    "labels": {
+        "app": "__APP__",
+        "scope": "__SCOPE__",
+        "type": "__TYPE__",
+        "external": "__EXTERNAL__",
+        "url": "__URL__"
+    }
+}

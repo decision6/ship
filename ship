@@ -1,0 +1,1214 @@
+#!/bin/bash
+#
+# Deploy an app into K8s/Marathon cluster by building
+# the container localy, based on a template
+#
+# Decision6 SHIP Deployer
+# github.com/decision6/ship.git
+#
+
+shopt -s expand_aliases
+
+if [[ -L $0 ]]; then
+    BASEDIR=$(dirname "$(readlink $0)")
+else
+    BASEDIR="$(cd "$(dirname "$0")" && pwd -P)"
+fi
+
+# shellcheck source=src/util/logger.sh
+source ${BASEDIR}/src/util/logger.sh
+# shellcheck source=src/util/slack.sh
+source ${BASEDIR}/src/util/slack.sh
+# shellcheck source=src/util/validators.sh
+source ${BASEDIR}/src/util/validator.sh
+# shellcheck source=src/plugins/docker.sh
+source ${BASEDIR}/src/plugins/docker.sh
+# shellcheck source=src/configure.sh
+source ${BASEDIR}/src/configure.sh
+# shellcheck source=src/util/config.sh
+source ${BASEDIR}/src/util/config.sh
+
+# Config files
+config::setFile ship "${BASEDIR}/src/config/${CONFIG_FILE}"
+config::setFile user "$HOME/.ship/config.json"
+
+# Aliases for version compatibility
+alias dsub=logger::sub
+alias decho=logger::echo
+alias dwarn=logger::warn
+alias dstep=logger::step
+alias dcode=logger::code
+alias derror=logger::error
+alias dtitle=logger::title
+alias dprintf=logger::printf
+
+APP_CONFIG=""
+
+# Ship local docker network settings
+SHIP_NET="ship.local"
+SHIP_NET_ADDR="172.99.0.0"
+SHIP_NET_MASK="16"
+SHIP_DNS_IP="172.99.0.53"
+
+# Default settings
+SHIP_VOL_CONTAINER="ship-volumes"
+SHIP_TMP_DIR=$HOME/.ship/tmp
+TEMPLATES_DIR=$BASEDIR/templates
+SLEEP_TIME=10
+REMOTE_CHECKS=15
+LOCAL_PRODUCTION=0
+ALL_CONTAINERS=0
+CONTAINER_MGMT="kubernetes"
+CONTAINER_MGMT_URL=""
+CONTAINER_MGMT_USR=""
+CONTAINER_MGMT_PWD=""
+APP_REPO_BASE_URL=""
+UPDATED=0
+TEMPLATES=""
+DEPENDENCIES=""
+USER_WORKSPACE=""
+REAL_USER_WORKSPACE=""
+SHIP_USERNAME=""
+SHIP_HOSTNAME=""
+FORCE=0
+
+# Resource limits
+RESOURCE_PROFILES=""
+DEFAULT_RESOURCE_PROFILE=""
+RESOURCE_MEM_MAX=1024
+RESOURCE_MEM_MIN=10
+RESOURCE_CPU_MIN=0.1
+RESOURCE_CPU_MAX=1
+
+# Registry settings
+REGISTRY_URL=""
+REGISTRY_USR=""
+REGISTRY_PWD=""
+REGISTRY_AUTH=""
+PREVIOUS_TAG=""
+
+# Slack settings
+SLACK_HOOK=""
+SLACK_CHANNEL=""
+
+# App config
+APP_TYPE=""
+APP_SCOPE="none"
+APP_MAIN_SCRIPT="app.js"
+APP_VERSION=""
+APP_EXPOSE=0
+APP_PORT=""
+APP_VOLUMES=""
+APP_ENV=""
+APP_LABELS=""
+APP_HEALTH="/health"
+APP_URL=""
+APP_BRANCH="master"
+APP_DEPS=""
+APP_REPO=""
+APP_RESOURCE_PROFILE=""
+
+# Template variable replacements
+APP_REPLACEMENTS=""
+GLOBAL_REPLACEMENTS=""
+
+# Detect OS
+MAC="darwin"
+LINUX="linux"
+UNKNOWN='unknown'
+OS=$UNKNOWN
+
+#
+# FUNCTIONS
+#
+
+function init() {
+    unamestr=`uname`
+    if [[ "$unamestr" == 'Linux' ]]; then
+        OS=$LINUX
+    elif [[ "$unamestr" == 'Darwin' ]]; then
+        OS=$MAC
+    fi
+
+    JQ=$(which jq)
+
+    if [[ "$JQ" == "" ]]; then
+        JQ=$BASEDIR/lib/$OS/jq
+    fi
+
+    if [[ -z ${REAL_USER+x} ]]; then
+        SHIP_USERNAME=$(whoami)
+    else
+        SHIP_USERNAME=${REAL_USER}
+    fi
+
+    if [[ -z ${REAL_HOST+x} ]]; then
+        SHIP_HOSTNAME=$(whoami)
+    else
+        SHIP_HOSTNAME=${REAL_HOST}
+    fi
+}
+
+function appConfig() {
+    local configFile currentDir
+
+    currentDir=$(pwd)
+
+    # When running inside a container, USER_WORKSPACE is the directory /workspace
+    # inside the container where the REAL_USER_WORKSPACE (the the real user workspace
+    # outside the container) is mounted so ship can look for ship.json files
+    # with that app config
+    export REAL_USER_WORKSPACE=$USER_WORKSPACE
+    if [[ "$SHIP_CONTAINER_WORKSPACE" != "" ]];
+    then
+        export USER_WORKSPACE=$SHIP_CONTAINER_WORKSPACE
+    fi
+
+    if [[ "$APP_NAME" == "" ]]; then
+        if [[ -f $currentDir/$APP_CONFIG_FILE ]]; then
+            configFile="$currentDir/$APP_CONFIG_FILE"
+        fi
+    else
+        if [[ "$APP_NAME" == "all" ]]; then
+            return 0;
+        fi
+
+        if [[ -f $USER_WORKSPACE/$APP_NAME/$APP_CONFIG_FILE ]]; then
+            configFile="$USER_WORKSPACE/$APP_NAME/$APP_CONFIG_FILE"
+        fi
+    fi
+
+    if [[ "$configFile" == "" ]]; then
+        return 1
+    fi
+
+    echo $configFile
+}
+
+function usage() {
+    dtitle "Usage"
+    echo
+    echo "ship ACTION APP_NAME [OPTIONS]"
+    echo
+    echo "APP_NAME     The app name. Must be equal to it's git repo, image name in registry"
+    echo "             and app folder on your workspace when using local dev deployments."
+    echo "                App name = 'app-test' will assume:"
+    echo "                Registry = <YOUR_CONFIGURED_REGISTRY>/app-test"
+    echo "                Repository = <YOUR_CONFIGURED_REPOSITORY>/app-test.git"
+    echo
+    dsub "ACTIONS [REMOTE]:"
+    echo "  deploy                    Build docker image, push to registry, create/update the app whith the new image"
+    echo "  release                   Build docker image and push to registry only"
+    echo "  build                     Build docker image only"
+    echo "  rollback                  Rollback to the last saved version of the selected APP (doesn't work on ship container)"
+    echo "  update                    Update an app to an existing image tag"
+    echo "  list                      List apps deployed in the cluster"
+    echo "  destroy                   CAUTION: Remove a production app (x_x)"
+    echo
+    dsub "ACTIONS [LOCAL]:"
+    echo "  local:deploy  | :deploy   Deploy locally on your computer"
+    echo "  local:destroy | :destroy  Remove all containers created by ship or the one in the ship.json file on this dir"
+    echo "  - local:destroy APP_NAME  To destroy a specific container"
+    echo "  - local:destroy all       To destroy all containers"
+    echo "  local:list    | :list     List all containers created by ship"
+    echo "  local:shell   | :shell    Connect to a local container shell (sh)"
+    echo "  local:logs    | :logs     Retrieve local container logs"
+    echo "  local:restart | :restart  Restarts a local container"
+    echo
+    dsub "ACTIONS [OTHER]:"
+    echo "  config                    Configure ship when running directly in your computer"
+    echo "  kube                      Jump to kubectl prompt"
+    echo "  help                      Display this help"
+    echo "  examples                  Display examples of usage"
+    echo "  profiles                  Display all avaiable resource profiles"
+    echo
+    dsub "OPTIONS:"
+    echo " --version                  Deploy/update to selected version"
+    echo " --type                     Template to use (node|node4|node6|php|html)"
+    echo " --scope                    Scope of application (labeling only) [OPTIONAL]"
+    echo "                            Examples: app|api|site|monitoring|devops (Defaults to 'none')"
+    echo "                              Only needed for new applications that are not in the cluster yet"
+    echo " --script                   Path to the main script of the application [OPTIONAL]"
+    echo " --health-url               Health check URI for the application (Defaults to '/health')"
+    echo " --expose                   Expose port so the app can be accessed externally [OPTIONAL]"
+    echo " --port                     Which host port to bind to when deploying locally [LOCAL][OPTIONAL]"
+    echo "                              Defaults to RANDOM free port over 3000"
+    echo " --url                      Comma-separated external URLs that an exposed service responds to [OPTIONAL]"
+    echo "                              Example: ship deploy app01 --url=\"app.mysite.com web.decision6.com\""
+    echo " --branch                   Which branch to checkout inside container for this application [OPTIONAL]"
+    echo " --repo                       The name of the repository for this application. [OPTIONAL]"
+    echo " --workspace                Set your workspace path to mount WORKSPACE/APP_NAME inside container [LOCAL][OPTIONAL]"
+    echo "                              If not defined will deploy production version"
+    echo " --no-mount                 Skip mounting your workspace/app dir into container /app dir [LOCAL][OPTIONAL]"
+    echo " --force                    Force running update even if the remote version is the same as --version [OPTIONAL]"
+    echo
+    dsub "USEFUL:"
+    echo "  On local deploys SHIP will mount your workspace in every container at /workspace."
+    echo "    - You can use that folder to link multiple projects for example."
+    echo "  All local containers share some folders to keep cache and config between them:"
+    echo "    - [ /data, /shared, /root/.cache, /root/.npm, /root/.composer, /root/.sbt ]"
+    echo
+    echo ">> VOLUME MOUNTS and LABELS can be added in the ship.json file. See 'ship examples for help'."
+    echo
+}
+
+function usageExamples() {
+    dtitle "Usage EXAMPLES"
+    echo
+    echo "Deploy api-indicators with node template:"
+    dcode "ship deploy my-app --type=node"
+    echo
+    echo "Deploy a new application with node template, classifying as an api:"
+    dcode "ship deploy my-app --type=node --scope=api"
+    echo
+    echo "Deploy app-web setting the default script to app/app.js:"
+    dcode "ship deploy my-app --type=node --script=app/app.js"
+    dcode "ship deploy my-app-http --type=node --script=http-server"
+    echo
+    echo "Rollback a deployment to the previous version (saved in the previous deploy attempt):"
+    dcode "ship rollback my-app"
+    echo
+    echo "Update api-indicatos in kubernetes to a specific existing image tag:"
+    dcode "ship update my-app --version=32"
+    echo
+    echo "Deploy app-web from test branch with the name app-web-beta"
+    dcode "ship deploy my-app-beta --branch=test --repo=github.com:whoami/app-name.git --type=node"
+    echo
+    echo "Deploy a container locally with a specific production version"
+    dcode "ship :deploy my-app --type=node --version=999"
+    echo
+    echo "Deploy a container locally pointing to the code on your machine"
+    dcode "ship :deploy app01 --type=node (if you have the env var WORKSPACE set and not empty)"
+    dcode "ship :deploy app01 --type=node --workspace=/home/user/workspace/ (will look for /home/user/workspace/app01)"
+    echo
+    echo "Destroy all local containers created by Ship"
+    dcode "ship :destroy"
+    echo
+    echo "Destroy a single local container created by Ship"
+    dcode "ship :destroy my-app"
+    echo
+    echo "Volume MOUNTS and LABELS in APP_SRC/ship.json"
+    dconf "{"
+    dconf "  \"ship\": {"
+    dconf "    \"name\": \"my-app\","
+    dconf "    \"type\": \"node\","
+    dconf "  },"
+    dconf "  \"remote\": {"
+    dconf "    \"labels\": [{"
+    dconf "        \"name\": \"enableHTTP\","
+    dconf "        \"value\": \"1\""
+    dconf "      }"
+    dconf "    ],"
+    dconf "    \"volumes\": [{"
+    dconf "      \"container\": \"/data\","
+    dconf "      \"host\": \"/nfs/persistent\""
+    dconf "    }]"
+    dconf "  }"
+    dconf "}"
+    echo
+}
+
+function shipInfo() {
+    echo
+    dtitle "SHIP Information"
+    echo
+    echo
+    dsub "SHIP CONFIG"
+    echo "--------------------------------------"
+    echo "SHIP_VERSION:       $(version)"
+    echo "TEMPLATES DIR:      $TEMPLATES_DIR"
+    echo "VCS DEFAULT URL:    $APP_REPO_BASE_URL"
+    echo "SLACK HOOK:         $SLACK_HOOK"
+    echo "SLACK CHANNEL:      $SLACK_CHANNEL"
+    echo "LOCAL USERNAME:     $USER_NAME"
+    echo "LOCAL HOSTNAME:     $USER_HOSTNAME"
+    echo
+    dsub "CONTAINER MANAGEMENT"
+    echo "--------------------------------------"
+    echo "TYPE:               $CONTAINER_MGMT"
+    echo "API URL:            $CONTAINER_MGMT_URL"
+    echo "API USERNAME:       $CONTAINER_MGMT_USR"
+    echo "API PASSWORD:       $CONTAINER_MGMT_PWD"
+    echo
+    dsub "REGISTRY CONFIG"
+    echo "--------------------------------------"
+    echo "REGISTRY URL:       $REGISTRY_URL"
+    echo "REGISTRY USR:       $REGISTRY_USR"
+    echo "REGISTRY PWD:       $REGISTRY_PWD"
+    echo
+    dsub "CURRENT APP CONFIG"
+    echo "--------------------------------------"
+    echo "TYPE:               $APP_TYPE"
+    echo "SCOPE:              $APP_SCOPE"
+    echo "MAIN SCRIPT:        $APP_MAIN_SCRIPT"
+    echo "EXPOSE:             $APP_EXPOSE"
+    echo "HEALTH CHECK URL:   $APP_HEALTH"
+    echo "APP EXTERNAL URL:   $APP_URL"
+    echo "APP VCS URL:        $APP_REPO"
+    echo "APP BRANCH:         $APP_BRANCH"
+    echo "APP DEPS:           $APP_DEPS"
+    echo
+    dsub "OTHER ARGS"
+    echo "--------------------------------------"
+    echo "SKIP_LOCAL_MOUNT:   $LOCAL_PRODUCTION"
+    echo "ALL_CONTAINERS:     $ALL_CONTAINERS"
+    echo "FORCE:              $FORCE"
+    echo
+}
+
+function deploy() {
+    dtitle "Deploying Application"
+    decho
+
+    # Check for app template
+    if [ "$APP_TYPE" == "" ]; then
+        derror "You must specify the template type using the --type option"
+        return 1
+    fi
+
+    # Needs to get latest tag?
+    if [ "$APP_VERSION" == "" ]; then
+        APP_VERSION=$(getNextTag)
+    fi
+
+    # Load resource limits and reservation (Resource Profile)
+    loadResourceProfile
+    if [ $? -eq 1 ]; then
+        derror "Deploy Failed"
+        return 1
+    fi
+
+    decho "---------------------------------------------------------------------"
+    decho "Deploying ${APP_NAME} with version: ${WHITE}${APP_VERSION}${NC}"
+    decho "Using template: ${WHITE}${APP_TYPE}${NC}"
+    decho "Repository: ${WHITE}${APP_REPO}${NC}"
+    decho "Branch: ${WHITE}${APP_BRANCH}${NC}"
+    decho "Resource Profile: ${WHITE}${APP_RESOURCE_PROFILE}${NC}"
+    decho "  - CPU Limit: ${WHITE}${CPU_LIMIT}${NC}"
+    decho "  - MEM Limit: ${WHITE}${MEMORY_LIMIT}M${NC}"
+    decho "---------------------------------------------------------------------"
+
+    # Build and tag image as both new version and latest
+    dockerBuild
+    if [[ $? -eq 1 ]]; then
+        derror "Docker Build Failed"
+        return 1
+    fi
+
+    # Push to private registry
+    dockerPush
+    if [[ $? -eq 1 ]]; then
+        derror "Docker Push Failed"
+        return 1
+    fi
+
+    # Cluster deploy
+    remoteDeploy
+    if [[ $? -eq 1 ]]; then
+        derror "Deploy Failed"
+        return 1
+    fi
+
+    slack::send "App $APP_NAME version $APP_VERSION deployed (from $USER_NAME @ $USER_HOSTNAME)"
+    dsuccess "Application Shipped!"
+}
+
+function update() {
+    dtitle "Updating Application"
+
+    # Load resource limits and reservation (Resource Profile)
+    loadResourceProfile
+    if [ $? -eq 1 ]; then
+        derror "Deploy Failed"
+        return 1
+    fi
+
+    decho "---------------------------------------------------------------------"
+    decho "Deploying ${APP_NAME} with version: ${WHITE}${APP_VERSION}${NC}"
+    decho "Using template: ${WHITE}${APP_TYPE}${NC}"
+    decho "Repository: ${WHITE}${APP_REPO}${NC}"
+    decho "Branch: ${WHITE}${APP_BRANCH}${NC}"
+    decho "Resource Profile: ${WHITE}${APP_RESOURCE_PROFILE}${NC}"
+    decho "  - CPU Limit: ${WHITE}${CPU_LIMIT}${NC}"
+    decho "  - MEM Limit: ${WHITE}${MEMORY_LIMIT}M${NC}"
+    decho "---------------------------------------------------------------------"
+
+    dsub "Verify Image Tag"
+    imageTagExists
+    if [[ $? -eq 1 ]]; then
+        derror "Docker image $REGISTRY_URL/$APP_NAME:$APP_VERSION not found"
+        derror "Update Failed"
+        return 1
+    fi
+
+    remoteDeploy
+    if [[ $? -eq 1 ]]; then
+        derror "Update Failed"
+        return 1
+    fi
+
+    slack::send "App $APP_NAME updated to version $APP_VERSION (from $USER_NAME @ $USER_HOSTNAME)"
+    dsuccess "Application Updated!"
+}
+
+function destroy() {
+    printf "${RED}"
+    echo "                #############        "
+    echo "              ##            *##      "
+    echo "             #               **#     "
+    echo "            #       %% %%    ***#    "
+    echo "           #       %%%%%%%   ****#   "
+    echo "          #         %%%%%    *****#  "
+    echo "          #   ###     %     ###***#  "
+    echo "          #  # ####       #### #**#  "
+    echo "          #  #     #     #     #**#  "
+    echo "          #   #####  # #  #####***#  "
+    echo "          #         #   #  *******#  "
+    echo "           ### #           **# ###   "
+    echo "               # - - - - - - #       "
+    echo "                | | | | | | |        "
+    echo
+    printf "${NC}"
+
+    dtitle "Production App Destroy"
+
+    if [[ "$APP_NAME" == "" ]]; then
+        derror "Missing application name"
+        return 1
+    fi
+
+    decho "TARGET: $APP_NAME"
+    decho
+
+    dsub "Destroy Confirmation:"
+    while true; do
+        printf "${ORANGE}Are you sure you wanna destroy a production app? [y/n] ${NC}"
+        read -r opt
+        case $opt in
+            [Yy]* ) break;;
+            [Nn]* ) exit 1;;
+            * ) decho "Please answer y or n";;
+        esac
+    done
+
+    while true; do
+        printf "${ORANGE}Ok sailor, if you are that brave, type 'I AM SURE': ${NC}"
+        read -r opt
+        opt=$(echo $opt | tr '[:upper:]' '[:lower:]')
+        if [ "$opt" == "i am sure" ]; then
+            break
+        else
+            derror "It seems that you are not so sure..."
+            return 1
+        fi
+    done
+
+    dsub "Triggering destroy..."
+    remoteDestroy
+    if [[ $? -eq 1 ]]; then
+        derror "Destroy Failed"
+        return 1
+    fi
+
+    slack::send "App $APP_NAME DESTROYED in PRODUCTION! (from $USER_NAME @ $USER_HOSTNAME)"
+    dsuccess "Application Destroyed!"
+}
+
+function loadResourceProfile() {
+    if [ "$APP_RESOURCE_PROFILE" == "" ]; then
+        if [ "$DEFAULT_RESOURCE_PROFILE" != "" ]; then
+            dwarn "Resource profile for this app not set. Using default: $DEFAULT_RESOURCE_PROFILE"
+            APP_RESOURCE_PROFILE=$DEFAULT_RESOURCE_PROFILE
+        else
+            derror "Resource profile for this app not set and no default value found."
+            return 1
+        fi
+    else
+        profileExists
+        if [[ ! $? ]]; then
+            derror "Resource profile '$APP_RESOURCE_PROFILE' does not exists."
+            return 1
+        fi
+    fi
+
+    CPU_LIMIT=$(echo $RESOURCE_PROFILES | $JQ ".$APP_RESOURCE_PROFILE.cpu" | tr -d '"')
+    MEMORY_LIMIT=$(echo $RESOURCE_PROFILES | $JQ ".$APP_RESOURCE_PROFILE.memory" | tr -d '"')
+
+    if [[ "$CPU_LIMIT" == "" || "$MEMORY_LIMIT" == "" ]]; then
+        derror "Resource profile '$APP_RESOURCE_PROFILE' must have 'cpu' and 'memory' defined."
+        return 1
+    fi
+
+    # Validate numeric
+    validator::isBetween $CPU_LIMIT $RESOURCE_CPU_MIN $RESOURCE_CPU_MAX
+    if [[ ! $? ]]; then
+        derror "CPU limit must be a number between $RESOURCE_CPU_MIN and $RESOURCE_CPU_MAX ($CPU_LIMIT)"
+        return 1
+    fi
+
+    # Validate integer limit
+    validator::isBetween $MEMORY_LIMIT $RESOURCE_MEM_MIN $RESOURCE_MEM_MAX
+    if [[ ! $? ]]; then
+        derror "Memory limit must be an integer between $RESOURCE_MEM_MIN and $RESOURCE_MEM_MAX ($MEMORY_LIMIT)"
+        return 1
+    fi
+}
+
+function profileExists() {
+    local count profile
+
+    if [[ "$RESOURCE_PROFILES" == "" ]]; then
+        return 1
+    fi
+
+    count=$(echo $RESOURCE_PROFILES | $JQ -c '. | length' | sed 's/null/0/g')
+    if [[ $count -eq 0 ]]; then
+        return 1
+    fi
+
+    profile=$(echo $RESOURCE_PROFILES | $JQ ".$APP_RESOURCE_PROFILE" | tr -d '"')
+    if [[ "$profile" == "" || "$profile" == "null" ]]; then
+        return 1
+    fi
+
+    return 0
+}
+
+function validate() {
+    if [[ ! -f $USER_CONFIG_FILE ]]; then
+        derror "Ship not configured, run 'ship config' first"
+        exit 1
+    fi
+
+    if [[ "$APP_NAME" == "" ]]; then
+        derror "You must specify app name"
+        exit 1
+    fi
+
+    if [[ "$APP_URL" == "" ]]; then
+        APP_URL=$APP_NAME
+    else
+        APP_URL=$(echo $APP_URL | sed 's#http[s]*://##g' | sed 's#,#|#g')
+    fi
+
+    # Create temporary dir
+    if [[ ! -d $SHIP_TMP_DIR/$APP_NAME/ ]]; then
+        mkdir -p $SHIP_TMP_DIR/$APP_NAME/
+    else
+        #find $SHIP_TMP_DIR/$APP_NAME/ ! -name 'previous_tag' -exec rm -rf {} +
+        rm -rf $SHIP_TMP_DIR/$APP_NAME/*.log
+        rm -rf $SHIP_TMP_DIR/$APP_NAME/*.json
+        rm -rf $SHIP_TMP_DIR/$APP_NAME/Dockerfile*
+    fi
+}
+
+function logs() {
+    local files
+
+    dtitle "Last Ship Logs"
+    decho "Displaying last ship logs for app: $APP"
+
+    if [[ ! -d $SHIP_TMP_DIR/$APP_NAME/ ]]; then
+        decho "No logs for app $APP_NAME"
+    else
+        files=$(tail $SHIP_TMP_DIR/$APP_NAME/*.log 2> /dev/null)
+
+        if [ "$files" == "" ];
+        then
+            decho "No logs for app $APP_NAME"
+            return 0
+        fi
+
+        echo
+        echo "BEGIN"
+        echo "-----"
+        echo
+        tail $SHIP_TMP_DIR/$APP_NAME/*.log
+        echo
+        echo "-----"
+        echo "END"
+        echo
+    fi
+
+    return 0
+}
+
+function updateShipImage() {
+    docker pull ${REGISTRY_URL}/ship:latest
+    return $?
+}
+
+function selfUpdate() {
+    local currentDir remoteRev originRev
+
+    decho "Updating SHIP..."
+    currentDir=$(pwd)
+    cd $BASEDIR || return 1
+
+    if [[ ! -d ".git" ]]; then
+        derror "Git repository not found!"
+        cd $currentDir && return 1
+        return 1
+    fi
+
+    remoteRev=$(git rev-parse origin/master)
+
+    # Could not get remote HEAD commit hash
+    if [[ ! $? -eq 0 ]]; then
+        derror "Error fetching git latest version. Could not update."
+        cd $currentDir && return 1
+        return 1
+    fi
+
+    originRev=$(git rev-parse HEAD)
+
+    # If updated return
+    if [[ "$remoteRev" == "$originRev" ]]; then
+        decho "SHIP already up-to-date."
+        cd $currentDir && return 1
+        return 0
+    fi
+
+    # Try to update
+    # git reset
+    git pull origin master > /dev/null
+
+    if [[ $? -eq 0 ]]; then
+        decho "SHIP was updated!"
+        cd $currentDir && return 1
+        return 0
+    else
+        decho "Errors were found while trying to update!"
+        cd $currentDir && return 1
+        return 1
+    fi
+}
+
+function readShipConf() {
+    readConf "ship"
+    return $?
+}
+
+function readShipUserConf() {
+    readConf "user"
+    return $?
+}
+
+function readConf() {
+    configFile=$1
+
+    # Check for custom templates dir
+    config::toVar "USER_TEMPLATES_DIR" '.ship.templates.dir' $configFile
+    config::toVar "USER_TEMPLATES_GIT_UPDATE" '.ship.templates.git_update' $configFile
+    config::toVar "USER_TEMPLATES_GIT_RESET" '.ship.templates.git_reset' $configFile
+
+    # Notification settings
+    config::toVar "SLACK_CHANNEL" '.ship.notify.slack.channel' $configFile
+    config::toVar "SLACK_HOOK" '.ship.notify.slack.hook' $configFile
+
+    # Repository data
+    config::toVar "APP_REPO_BASE_URL" '.ship.repository.repo_default_url' $configFile
+    config::toVar "APP_BRANCH" '.ship.repository.repo_default_branch' $configFile
+
+    # Create full vcs url based on base url and app name
+    if [ "$APP_REPO_BASE_URL" != "" ]; then
+        SEP="/"
+        [[ "${APP_REPO_BASE_URL: -1}" == "/" ]] && SEP=""
+        APP_REPO=${APP_REPO_BASE_URL}${SEP}${APP_NAME}.git
+    fi
+
+    # Cluster Settings
+    # Mount path
+    config::toVar "PERSISTENT_DIR" '.cluster.persistent_data_dir' $configFile
+    config::toVar "SHARED_DATA_DIR" '.cluster.shared_data_dir' $configFile
+    config::toVar "CONTAINER_PERSISTENT_DIR" '.cluster.container_persistent_dir' $configFile
+    config::toVar "CONTAINER_SHARED_DIR" '.cluster.container_shared_dir' $configFile
+
+    # Registry default settings
+    config::toVar "REGISTRY_URL" '.registry.url' $configFile
+    config::toVar "REGISTRY_USR" '.registry.username' $configFile
+    config::toVar "REGISTRY_PWD" '.registry.password' $configFile
+
+    if [[ "$REGISTRY_USR" != "" && "$REGISTRY_PWD" != "" ]]; then
+        REGISTRY_AUTH="-u ${REGISTRY_USR}:${REGISTRY_PWD}"
+    fi
+
+    # Default container orchestration plugin to load
+    config::toVar "CONTAINER_MGMT" '.container_management.type' $configFile
+    config::toVar "CONTAINER_MGMT_URL" '.container_management.api_url' $configFile
+    config::toVar "CONTAINER_MGMT_USR" '.container_management.api_username' $configFile
+    config::toVar "CONTAINER_MGMT_PWD" '.container_management.api_password' $configFile
+    config::toVar "USER_WORKSPACE" '.ship.user_workspace' $configFile
+
+    # Global dependencies
+    config::toVar "DEPENDENCIES" '.dev.dependencies' $configFile --keep-quotes
+    config::toVar "TEMPLATES" '.dev.templates' $configFile --keep-quotes
+
+    # Container Resource Limits
+    config::toVar "RESOURCE_PROFILES" '.resource_profiles.profiles' $configFile --keep-quotes
+    config::toVar "DEFAULT_RESOURCE_PROFILE" '.resource_profiles.default' $configFile
+
+    # Template custom replacement variables
+    config::toVar "GLOBAL_REPLACEMENTS" '.replacements' $configFile --keep-quotes
+
+    # Detect local machine username and hostname
+    if [[ "$USER_NAME" == "" ]]; then
+        USER_NAME=$(whoami)
+    fi
+
+    if [[ "$USER_HOSTNAME" == "" ]]; then
+        USER_HOSTNAME=$(hostname)
+    fi
+
+    return 0
+}
+
+function readAppConf() {
+    local config depName configFile="app"
+
+    config=$(appConfig)
+
+    [[ $? == 1 ]] && return 1
+
+    APP_CONFIG=$config
+
+    config::setFile "app" $config
+
+    # APP Ship Config
+    config::toVar "APP_NAME" '.ship.name' $configFile
+    config::toVar "APP_TYPE" '.ship.type' $configFile
+    config::toVar "APP_SCOPE" '.ship.scope' $configFile
+    config::toVar "APP_URL" '.ship.url' $configFile
+    config::toVar "APP_BRANCH" '.vcs.branch' $configFile
+    config::toVar "APP_REPO" '.vcs.url' $configFile
+
+    # Container management
+    config::toVar "CONTAINER_MGMT" '.container_management.type' $configFile
+    config::toVar "CONTAINER_MGMT_URL" '.container_management.api_url' $configFile
+    config::toVar "CONTAINER_MGMT_USR" '.container_management.api_username' $configFile
+    config::toVar "CONTAINER_MGMT_PWD" '.container_management.api_password' $configFile
+
+    # Local deployment config
+    config::toVar "APP_PORT_LOCAL" '.local.port' $configFile
+
+    # APP Container Config
+    config::toVar "APP_EXPOSE" '.remote.expose' $configFile
+    if [ "$APP_EXPOSE" == "true" ] || [ "$APP_EXPOSE" == "1" ]; then
+        APP_EXPOSE=1
+    else
+        APP_EXPOSE=0
+    fi
+
+    config::toVar "APP_HEALTH" '.remote.health' $configFile
+    config::toVar "APP_PORT" '.remote.port' $configFile
+    config::toVar "APP_VOLUMES" '.remote.volumes' $configFile --keep-quotes
+
+    # Custom labels
+    config::toVar "APP_LABELS" '.remote.labels' $configFile --keep-quotes
+
+    # Custom environment variables
+    config::toVar "APP_ENV" '.remote.env' $configFile --keep-quotes
+
+    # Container Resource Limits
+    config::toVar "APP_RESOURCE_PROFILE" '.remote.resource_profile' $configFile
+
+    # APP Registry Config
+    config::toVar "REGISTRY_URL" '.registry.url' $configFile
+    config::toVar "REGISTRY_USR" '.registry.username' $configFile
+    config::toVar "REGISTRY_PWD" '.registry.password' $configFile
+
+    if [ "$REGISTRY_USR" != "" ] && [ "$REGISTRY_PWD" != "" ]; then
+        export REGISTRY_AUTH="-u ${REGISTRY_USR}:${REGISTRY_PWD}"
+    fi
+
+    # Template custom replacement variables
+    config::toVar "APP_REPLACEMENTS" '.replacements' $configFile --keep-quotes
+
+    # APP Dependencies
+    config=$(cat $configFile)
+    count=$(echo $config | $JQ '.dependencies | length')
+
+    APP_DEPS=""
+    for ((i=0;i<$count;i++))
+    do
+        depName=$(echo $config | $JQ '.dependencies['${i}'].name' | tr -d '"')
+        APP_DEPS="$APP_DEPS $depName"
+    done
+
+    APP_DEPS=( $APP_DEPS )
+    return 0
+}
+
+function buildShip() {
+    local nextTag tmpDir imageID
+
+    dtitle "SHIP Docker Image Build"
+
+    APP_NAME="ship"
+    nextTag=$(getNextTag)
+
+    decho
+    decho "----------------------"
+    decho "NEXT TAG: ${WHITE}$nextTag${NC}"
+    decho "----------------------"
+    decho
+
+    if [ ! -d "./dockerfile" ]; then
+        derror "Directory ./dockerfile not found. Run this command from ship soure dir."
+        return 1
+    fi
+
+    if [ ! -f "./dockerfile/Dockerfile" ]; then
+        derror "Docker file not found in ./dockerfile/. May you need to reset ship source repository."
+        return 1
+    fi
+
+    dsub "Preparing template..."
+    tmpDir=/tmp/shipbuild
+    mkdir -p $tmpDir
+    cp ./dockerfile/* $tmpDir/
+    sed -i -e "s#__SHIP_VERSION__#$nextTag#g" $tmpDir/Dockerfile
+
+    dsub "Checking previous image..."
+    imageID=$(docker images $REGISTRY_URL/$APP_NAME:$nextTag --format="{{.ID}}")
+    if [[ "$imageID" != "" ]]; then
+        decho "Previous image with tag $nextTag found. Removing it..."
+        docker rmi -f $imageID
+    fi
+
+    dsub "Building image..."
+    cd $tmpDir || return 1
+    docker build -t $REGISTRY_URL/$APP_NAME:latest -t $REGISTRY_URL/$APP_NAME:$nextTag .
+    if [ ! $? -eq 0 ]; then
+        derror "Error building SHIP image"
+    fi
+
+    dsub "Cleaning up..."
+    rm -rf $tmpDir
+
+    dsuccess "Finished!"
+    return 0
+}
+
+function listProfiles() {
+    local count profiles
+
+    dtitle "Resource Profiles List"
+    decho
+
+    if [[ "$RESOURCE_PROFILES" == "" ]]; then
+        derror "No resource profiles found"
+        return 1
+    fi
+
+    count=$(echo $RESOURCE_PROFILES | $JQ -c '. | length' | sed 's/null/0/g')
+    if [[ $count -eq 0 ]]; then
+        derror "No resource profiles found"
+        return 1
+    fi
+
+    echo "+----------------------+------------+------------+"
+    printf "| %-20s | %-10s | %-10s |\n" "NAME" "CPU" "MEMORY"
+    echo "+----------------------+------------+------------+"
+
+    profiles=( $(echo $RESOURCE_PROFILES | $JQ 'keys[]') )
+    for profile in ${profiles[@]}; do
+        name=$(echo $profile | tr -d '"')
+        cpu=$(echo $RESOURCE_PROFILES | $JQ ".${profile}.cpu" | tr -d '"')
+        mem=$(echo $RESOURCE_PROFILES | $JQ ".${profile}.memory" | tr -d '"')
+        printf "| %-20s | %10s | %10s |\n" $name $cpu "${mem}M"
+    done
+
+    echo "+----------------------+------------+------------+"
+}
+
+function version() {
+    if [[ -z ${SHIP_VERSION+x} ]]; then
+        echo "UNKNOWN"
+        return 1
+    else
+        echo "$SHIP_VERSION"
+        return 0
+    fi
+}
+
+function header() {
+    declare -a shipList
+    shipList[1]="Jolly Roger — Peter Pan by J. M. Barrie"
+    shipList[2]="Nautilus — 20.000 Leagues Under the Sea"
+    shipList[3]="Vingilot — The Silmarillion by J. R. R. Tolkien"
+    shipList[4]="Black Pearl – Pirates of the Caribbean"
+    shipList[5]="Red October — The Hunt for Red October by Tom Clancy"
+    shipList[6]="Argonaut — Heroic Age"
+    shipList[7]="The Inferno – The Goonies"
+    shipList[8]="Jenny – Forrest Gump"
+    shipList[9]="Rachel – Moby-Dick, 1956, 1998"
+    shipList[10]="USS Scotia - 30,000 Leagues Under the Sea, 2007"
+    shipList[11]="Skyship Weatherlight - Magic The Gathering"
+
+    rand=$(awk -v min=1 -v max=11 'BEGIN{srand(); print int(min+rand()*(max-min+1))}')
+
+    # ' # <- Adding a single quote in a commentary just because the above
+    # 'rand' line is breaking the syntax highlighting from here on
+    decho
+    decho " ███████╗██╗  ██╗██╗██████╗         _~          "
+    decho " ██╔════╝██║  ██║██║██╔══██╗     _~ )_)_~       "
+    decho " ███████╗███████║██║██████╔╝     )_))_))_)      "
+    decho " ╚════██║██╔══██║██║██╔═══╝      _!__!__!_      "
+    decho " ███████║██║  ██║██║██║          \_______/      "
+    decho " ╚══════╝╚═╝  ╚═╝╚═╝╚═         ~~~~~~~~~~~~~    "
+    decho "---------------------------------------------------------------------"
+    decho "█ Featured Ship: ${shipList[$rand]} █"
+    decho "---------------------------------------------------------------------"
+    decho
+
+    if [ "$APP_CONFIG" != "" ]; then
+        decho "APP config file: ${UNDERLINE}$APP_CONFIG${NC}"
+    else
+        decho "APP config file:  ${RED}NOT FOUND${NC}"
+    fi
+
+    if [ "$USER_CONFIG_FILE" != "" ]; then
+        decho "SHIP config file: ${UNDERLINE}$USER_CONFIG_FILE${NC}"
+    else
+        decho "SHIP config file: ${RED}NOT FOUND${NC}"
+    fi
+
+    echo
+}
+
+#
+# MAIN
+#
+init
+
+ACTION=$1
+APP_NAME=$2
+shift
+shift
+
+# Read local conf file if found in current dir or in USER_WORKSPACE/APP_NAME
+readShipConf
+readShipUserConf
+readAppConf
+
+# Use custom templates dir from user
+if [ "$USER_TEMPLATES_DIR" != "" ]; then
+    if [ -d $USER_TEMPLATES_DIR ]; then
+        TEMPLATES_DIR=$USER_TEMPLATES_DIR
+        decho "Using user defined templates dir: $TEMPLATES_DIR"
+    else
+        dwarn "User templates dir not found. Using default: $TEMPLATES_DIR"
+    fi
+fi
+
+# Load the correct container orchestration plugin
+if [ "$CONTAINER_MGMT" == "" ]; then
+    derror "Container orchestrator not informed"
+    exit 1
+elif [ -f "${BASEDIR}/src/plugins/$CONTAINER_MGMT.sh" ]; then
+    source ${BASEDIR}/src/plugins/$CONTAINER_MGMT.sh
+else
+    derror "Container orchestration plugin $CONTAINER_MGMT not found"
+    exit 1
+fi
+
+# Override any previous config with user defined arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+      --expose)
+        APP_EXPOSE=1
+        ;;
+      --scope=*)
+        APP_SCOPE="${1#*=}"
+        ;;
+      --type=*)
+        APP_TYPE="${1#*=}"
+        ;;
+      --script=*)
+        APP_MAIN_SCRIPT="${1#*=}"
+        ;;
+      --health-uri=*)
+        APP_HEALTH="${1#*=}"
+        ;;
+      --port=*)
+        APP_PORT="${1#*=}"
+        ;;
+      --url=*)
+        APP_URL="${1#*=}"
+        ;;
+      --branch=*)
+        APP_BRANCH="${1#*=}"
+        ;;
+      --workspace=*)
+        USER_WORKSPACE="${1#*=}"
+        ;;
+      --version=*)
+        APP_VERSION="${1#*=}"
+        ;;
+      --repo=*)
+        APP_REPO="${1#*=}"
+        ;;
+      --no-mount)
+        LOCAL_PRODUCTION=1
+        ;;
+      --all)
+        ALL_CONTAINERS=1
+        ;;
+      --force)
+        FORCE=1
+        ;;
+      \?)
+        echo "Invalid option: -$OPTARG" >&2
+        echo
+        usage
+        exit 1
+        ;;
+    esac
+    shift
+done
+
+retval=0
+
+# Options
+case "$ACTION" in
+    "deploy")
+        header
+        validate
+        deploy
+        retval=$?
+        ;;
+    "update")
+        header
+        validate
+        update
+        retval=$?
+        ;;
+    "destroy")
+        header
+        validate
+        destroy
+        retval=$?
+        ;;
+    "release")
+        header
+        validate
+        loadResourceProfile && dockerBuild && dockerPush
+        retval=$?
+        ;;
+    "build")
+        header
+        validate
+        loadResourceProfile && dockerBuild
+        retval=$?
+        ;;
+    "rollback")
+        header
+        validate
+        remoteRollback 1
+        retval=$?
+        ;;
+    "list")
+        header
+        remoteList
+        retval=$?
+        ;;
+    "config")
+        header
+        config
+        retval=$?
+        ;;
+    "logs")
+        header
+        logs
+        retval=$?
+        ;;
+    "local")
+        header
+        loadResourceProfile
+        localDeploy
+        retval=$?
+        ;;
+    "local:deploy"|":deploy"|":a")
+        header
+        loadResourceProfile
+        localDeploy
+        retval=$?
+        ;;
+    "local:destroy"|":destroy"|":d")
+        header
+        localDestroy
+        retval=$?
+        ;;
+    "local:list"|":list"|":l")
+        header
+        localList
+        retval=$?
+        ;;
+    "local:shell"|":shell"|":s")
+        header
+        localShell
+        retval=$?
+        ;;
+    "local:restart"|":restart"|":r")
+        header
+        localRestart
+        retval=$?
+        ;;
+    "local:logs"|":logs"|":l")
+        header
+        localLogs
+        retval=$?
+        ;;
+    "self-update")
+        header
+        selfUpdate
+        retval=$?
+        ;;
+    "kube")
+        header
+        kubePrompt
+        retval=$?
+        ;;
+    "build-ship")
+        header
+        buildShip
+        retval=$?
+        ;;
+    "profiles")
+        header
+        listProfiles
+        retval=$?
+        ;;
+    "version")
+        echo "SHIP Version $(version)"
+        retval=$?
+        ;;
+    "shortlist")
+        echo "deploy update rollback list config logs local local:deploy local:destroy local:list local:shell local:logs local:restart :deploy :destroy :list :shell :logs :restart self-update kube build version info help"
+        retval=$?
+        ;;
+    "help")
+        header
+        usage
+        retval=$?
+        ;;
+    "examples")
+        header
+        usageExamples
+        retval=$?
+        ;;
+    "info")
+        header
+        shipInfo
+        retval=$?
+        ;;
+    *)
+        derror "Wrong action: '$ACTION'"
+        decho "Run 'ship help' for more info about usage"
+        retval=1
+        ;;
+esac
+
+echo
+exit $retval

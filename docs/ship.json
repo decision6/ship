@@ -1,0 +1,41 @@
+{
+  "ship": {
+    "name": "app-web",
+    "type": "node",
+    "scope": "app",
+    "url": ["app.decision6.com", "web.decision6.com"] // REMOVE
+  },
+  "vcs": {
+    "branch": "master",
+    "url": "git@github.com:yourcompany/repo.git"
+  },
+  "build": {
+    "includes": ["src", "main.py", "Makefile"],
+    "excludes": []
+  },
+  "local": {
+    "ports": ["3004:80"],
+    "dependencies": [{
+      "name": "api-login"
+    }]
+  },
+  "remote": {
+    "resource_profile": "memory_low",
+    "expose": true, // REMOVE
+    "healthcheck": {
+      "uri": "/health",
+      "port": 8080,
+      "timeout": 30,
+      "interval": 50,
+      "grace_period": 300
+    },
+    "labels": [{
+      "name": "SOMETHING",
+      "value": "1"
+    }],
+    "env": [{
+      "name": "WUT",
+      "value": "1234"
+    }]
+  }
+}
