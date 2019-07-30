@@ -383,25 +383,13 @@ examples      | none      | Display examples of usage
    Option    | Description
 :----------: | :---------------------------------------------------------------------------------------------
  --version   | Deploy/update to selected version
-   --type    | Template to use (will look for TEMPLATES_DIR>/type/Dockerfile)
-  --scope    | Scope of application to classify in cluster (Defaults to 'none')
-             | Only needed for new applications that are not in k8s yet [OPTIONAL]
-  --script   | Main script of the application. Defaults to app.js [OPTIONAL]
---health_uri | Health check URI for the application. Defaults to '/health' [OPTIONAL]
-  --expose   | Expose port so the app can be accessed externally [OPTIONAL]
-   --port    | Which host port to bind to when deploying locally, defaults to RANDOM [OPTIONAL]
-   --url     | List of comma-separated external URLs that an exposed service responds to [OPTIONAL]
-             | Example: app-name responds to app.company.com and web.company.com
-             | `bash ship deploy app-name --type=node --url=app.company.com,web.company.com`
-             | Only used when creating a new application
-  --branch   | Which branch to checkout inside container for this application [OPTIONAL]
-   --repo    | The name of the repository for this application [OPTIONAL]
-             | Example: ship deploy app-name -beta -b test -r app-name -t node
---workspace  | Define a custom workspace path and try to mount WORKSPACE/APP_NAME inside container [OPTIONAL]
-             | If not defined will use the env var WORKSPACE if set. Else will deploy production version
-             | Example: ship local flow-engine -t php -w $WORKSPACE
-             | Only used when deploying a loca application with the 'local' option
+   --type    | Template to use (will look for TEMPLATES_DIR/type/Dockerfile)
+  --scope    | Scope of application to classify in cluster (Defaults to 'none'). Only needed for new applications that are not in k8s yet (OPTIONAL)
+  --script   | Main script of the application. Defaults to app.js (OPTIONAL)
+--health_uri | Health check URI for the application. Defaults to '/health' (OPTIONAL)
+   --port    | Which host port to bind to when deploying locally, defaults to RANDOM (OPTIONAL)
+--workspace  | Define a custom workspace path and try to mount WORKSPACE/APP_NAME inside container. If not defined will use the env var WORKSPACE if set. Else will deploy production version. Example: ship local flow-engine -t php -w $WORKSPACE (OPTIONAL - Only used when deploying a local application with the 'local' option)
  --app-dir   | Where to mount your local workspace app dir inside container
 --skip-mount | Does not mount your development code into the container LOCAL_DEPLOY_APP_DIR
-  --force    | Force running update even if the remote version is the same as define in --version [OPTIONAL]
-   --all     | Run action to all containers [OPTIONAL]
+  --force    | Force running update even if the remote version is the same as define in --version (OPTIONAL)
+   --all     | Run action to all containers (OPTIONAL)
